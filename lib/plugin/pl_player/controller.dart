@@ -182,10 +182,11 @@ class PlPlayerController
   int _watchLastBuf = -1;
   int _watchBufStallTicks = 0;
   int _watchFrozenTicks = 0;
-  static const int _softRecoverRemainSec = 18;
-  /// Buffer not growing for this many 2s samples while playing → download likely dead.
-  static const int _bufStallSamples = 3; // ~6s
-  /// Hard freeze fallback (pos+buf both stuck), should be rare if proactive path works.
+  /// Reconnect while this much cache still remains (seconds).
+  static const int _proactiveRemainSec = 45;
+  /// Buffer not growing for this many 2s samples → download likely idle/dead.
+  static const int _bufStallSamples = 2; // ~4s
+  /// Hard freeze fallback if proactive path missed.
   static const int _freezeStuckSamples = 4; // ~8s
   StreamSubscription? _subForSeek;
   StreamSubscription<NetworkPolicyChange>? _networkPolicySubscription;
@@ -1833,21 +1834,65 @@ class PlPlayerController
     _watchFrozenTicks = 0;
   }
 
-  /// Silent reopen at current position. No toast.
-  void _softRefreshPlayer() {
+  /// Light recovery first (seek), escalate to full open if still stuck.
+  /// No toast. Independent of error logs.
+  void _softRefreshPlayer({bool forceFull = false}) {
     if (dataSource is FileSource || isLive) return;
     EasyThrottle.throttle(
       'streamSoftRecover',
-      const Duration(seconds: 15),
-      () {
+      const Duration(seconds: 12),
+      () async {
+        final pos = position.value;
+        final buf = buffered.value;
         if (kDebugMode) {
           debugPrint(
-            'streamWatch: silent refresh pos=${position.value}s buf=${buffered.value}s',
+            'streamWatch: recover forceFull=$forceFull pos=${pos}s buf=${buf}s',
           );
         }
+        if (!forceFull) {
+          // Light path: seek to current position to kick demuxer/HTTP without full reopen.
+          final ok = await _lightRecoverSeek();
+          if (ok) {
+            // Give the light path a moment; freeze watch will escalate if still stuck.
+            _watchBufStallTicks = 0;
+            _watchFrozenTicks = 0;
+            _watchLastPos = position.value;
+            _watchLastBuf = buffered.value;
+            return;
+          }
+        }
+        // Heavy path: full open at current position (may briefly black-screen).
         refreshPlayer();
       },
     );
+  }
+
+  /// Try to resume network read without tearing down VO/decoder.
+  /// Returns true if a seek was issued.
+  Future<bool> _lightRecoverSeek() async {
+    final player = _videoPlayerController;
+    if (player == null) return false;
+    try {
+      final current = player.state.position;
+      // Tiny forward nudge helps some demuxers re-issue range requests.
+      var target = current;
+      final dur = player.state.duration;
+      if (dur > Duration.zero) {
+        final nudged = current + const Duration(milliseconds: 50);
+        target = nudged < dur ? nudged : current;
+      }
+      if (kDebugMode) {
+        debugPrint('streamWatch: light seek -> ${target.inMilliseconds}ms');
+      }
+      await player.seek(target);
+      if (!player.state.playing && playerStatus.isPlaying) {
+        await player.play();
+      }
+      return true;
+    } catch (e) {
+      if (kDebugMode) debugPrint('streamWatch: light seek failed: $e');
+      return false;
+    }
   }
 
   void _armSoftRecover({required bool forceSoon}) {
@@ -1864,7 +1909,7 @@ class PlPlayerController
   }
 
   /// Background watch while content is still playing from cache.
-  /// Goal: reconnect before the buffering spinner is shown.
+  /// Must fire BEFORE isBuffering latches, otherwise only the black-screen fallback runs.
   void _ensureFreezeWatch() {
     if (isLive || dataSource is FileSource) return;
     if (_freezeWatchTimer != null) return;
@@ -1884,7 +1929,6 @@ class PlPlayerController
         _watchLastBuf = buffered.value;
         return;
       }
-      // Run during normal play too — not only when already buffering.
       if (!playerStatus.isPlaying && !isBuffering.value) {
         _watchBufStallTicks = 0;
         _watchFrozenTicks = 0;
@@ -1899,35 +1943,47 @@ class PlPlayerController
       final posMoved = pos > _watchLastPos;
       final bufMoved = buf > _watchLastBuf;
 
-      // --- Proactive path: still playing from cache, download already dead ---
-      // Buffer stopped growing while playback continues → CDN/stream likely dropped.
-      if (playerStatus.isPlaying && !isBuffering.value) {
-        if (bufMoved) {
-          _watchBufStallTicks = 0;
-        } else if (posMoved) {
-          _watchBufStallTicks++;
-        }
-        // Reconnect early while user still watches remaining cache (no spinner yet).
-        final downloadLikelyDead = _watchBufStallTicks >= _bufStallSamples;
-        final cacheRunningLow =
-            remain >= 0 && remain <= _softRecoverRemainSec && posMoved;
-        if (downloadLikelyDead && (cacheRunningLow || remain <= 30)) {
-          if (kDebugMode) {
-            debugPrint(
-              'streamWatch: proactive reconnect remain=${remain}s bufStall=$_watchBufStallTicks',
-            );
-          }
-          _watchBufStallTicks = 0;
-          _softRefreshPlayer();
-        }
+      // Track download health even after buffering flag flips true.
+      if (bufMoved) {
+        _watchBufStallTicks = 0;
+      } else if (posMoved || isBuffering.value) {
+        // pos advancing with flat buffer, or already buffering with flat buffer.
+        _watchBufStallTicks++;
       }
 
-      // --- Fallback: already frozen (spinner may show) ---
+      // --- Proactive: still have cache headroom, download not advancing ---
+      // Do NOT require !isBuffering — the flag often flips true only when remain is tiny.
+      final downloadStalled = _watchBufStallTicks >= _bufStallSamples;
+      final hasCacheHeadroom = remain > 2;
+      final shouldProactive = downloadStalled &&
+          hasCacheHeadroom &&
+          remain <= _proactiveRemainSec;
+      if (shouldProactive) {
+        if (kDebugMode) {
+          debugPrint(
+            'streamWatch: proactive reconnect remain=${remain}s '
+            'bufStall=$_watchBufStallTicks buffering=${isBuffering.value}',
+          );
+        }
+        _watchBufStallTicks = 0;
+        _watchFrozenTicks = 0;
+        _softRefreshPlayer();
+      } else if (downloadStalled && isBuffering.value && remain <= 5) {
+        // Spinner + almost no cache: light seek rarely helps, go full open.
+        if (kDebugMode) {
+          debugPrint('streamWatch: early full open at spinner remain=$remain');
+        }
+        _watchBufStallTicks = 0;
+        _watchFrozenTicks = 0;
+        _softRefreshPlayer(forceFull: true);
+      }
+
+      // --- Hard fallback: fully frozen → full open (light seek already failed or too late)
       if (!posMoved && !bufMoved) {
         _watchFrozenTicks++;
         if (_watchFrozenTicks >= _freezeStuckSamples) {
           _watchFrozenTicks = 0;
-          _softRefreshPlayer();
+          _softRefreshPlayer(forceFull: true);
         }
       } else {
         _watchFrozenTicks = 0;
@@ -2143,6 +2199,7 @@ class PlPlayerController
           buffering,
           player.state.position,
         );
+        final wasBuffering = isBuffering.value;
         isBuffering.value = buffering;
         if (buffering && !isLive) {
           _weakWifiBufferTimer ??= Timer(const Duration(seconds: 5), () {
@@ -2152,6 +2209,18 @@ class PlPlayerController
             }
           });
           _ensureFreezeWatch();
+          // Rising edge of buffering: if cache already thin or download was stalling, reconnect now.
+          if (!wasBuffering) {
+            final remain = buffered.value - position.value;
+            if (remain <= _proactiveRemainSec || _watchBufStallTicks >= _bufStallSamples) {
+              if (kDebugMode) {
+                debugPrint(
+                  'streamWatch: buffering edge reconnect remain=$remain stall=$_watchBufStallTicks',
+                );
+              }
+              _softRefreshPlayer();
+            }
+          }
         } else {
           _weakWifiBufferTimer?.cancel();
           _weakWifiBufferTimer = null;

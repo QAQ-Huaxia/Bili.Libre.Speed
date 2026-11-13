@@ -174,6 +174,10 @@ class PlPlayerController
 
   Timer? _timer;
   Timer? _weakWifiBufferTimer;
+  /// Soft recover: keep playing demuxer cache, reconnect before it runs dry.
+  Timer? _softRecoverTimer;
+  bool _pendingSoftRecover = false;
+  static const int _softRecoverRemainSec = 12;
   StreamSubscription? _subForSeek;
   StreamSubscription<NetworkPolicyChange>? _networkPolicySubscription;
   Future<void> Function(NetworkPolicyChange change)? onNetworkPolicyChanged;
@@ -1714,6 +1718,9 @@ class PlPlayerController
   ) async {
     _weakWifiBufferTimer?.cancel();
     _weakWifiBufferTimer = null;
+    _softRecoverTimer?.cancel();
+    _softRecoverTimer = null;
+    _pendingSoftRecover = false;
     isBuffering.value = false;
     _heartDuration = 0;
     danmakuController?.clear();
@@ -1804,6 +1811,9 @@ class PlPlayerController
     if (dataSource is FileSource) {
       return null;
     }
+    _softRecoverTimer?.cancel();
+    _softRecoverTimer = null;
+    _pendingSoftRecover = false;
     if (_videoPlayerController case final ctr? when (ctr.current.isNotEmpty)) {
       PlaybackStatsService.rebase(ctr.state.position);
       var media = ctr.current.last;
@@ -1993,6 +2003,22 @@ class PlPlayerController
       }),
       stream.buffer.listen((Duration buffer) {
         buffered.value = buffer.inSeconds;
+        // While still playing cached packets, silently reopen before cache runs dry.
+        if (_pendingSoftRecover && !isLive) {
+          final remain = buffer.inSeconds - position.value;
+          if (remain >= 0 && remain <= _softRecoverRemainSec) {
+            _pendingSoftRecover = false;
+            _softRecoverTimer?.cancel();
+            _softRecoverTimer = null;
+            EasyThrottle.throttle(
+              'streamSoftRecover',
+              const Duration(seconds: 8),
+              () {
+                refreshPlayer();
+              },
+            );
+          }
+        }
       }),
       stream.buffering.listen((bool buffering) {
         PlaybackStatsService.updateBuffering(
@@ -2053,6 +2079,27 @@ class PlPlayerController
               event.startsWith("Can not open external file https://")) {
             Timer(const Duration(milliseconds: 3000), refreshPlayer);
           }
+          return;
+        }
+        // Stream corruption / CDN premature close: keep playing demuxer cache,
+        // mark soft recover and reopen silently before buffer is exhausted.
+        if (event.contains('Stream ends prematurely') ||
+            event.contains('Invalid NAL unit size') ||
+            (event.contains('tls:') &&
+                (event.contains('End of file') ||
+                    event.contains('Failed to send close message')))) {
+          _pendingSoftRecover = true;
+          _softRecoverTimer?.cancel();
+          // Fallback: if already stalled (almost no remaining cache), hard recover.
+          _softRecoverTimer = Timer(const Duration(seconds: 6), () {
+            _softRecoverTimer = null;
+            if (!_pendingSoftRecover) return;
+            if (isBuffering.value &&
+                buffered.value <= position.value + 2) {
+              _pendingSoftRecover = false;
+              refreshPlayer();
+            }
+          });
           return;
         }
         if (event.startsWith("Failed to open https://") ||
@@ -2117,6 +2164,9 @@ class PlPlayerController
     _subscriptions?.forEach((e) => e.cancel());
     _subscriptions?.clear();
     _subscriptions = null;
+    _softRecoverTimer?.cancel();
+    _softRecoverTimer = null;
+    _pendingSoftRecover = false;
   }
 
   void _cancelSubForSeek() {
@@ -3174,6 +3224,9 @@ class PlPlayerController
     _timer?.cancel();
     _weakWifiBufferTimer?.cancel();
     _weakWifiBufferTimer = null;
+    _softRecoverTimer?.cancel();
+    _softRecoverTimer = null;
+    _pendingSoftRecover = false;
     _networkPolicySubscription?.cancel();
     _networkPolicySubscription = null;
     onNetworkPolicyChanged = null;

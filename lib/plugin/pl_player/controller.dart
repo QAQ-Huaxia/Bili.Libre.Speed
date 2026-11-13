@@ -174,10 +174,19 @@ class PlPlayerController
 
   Timer? _timer;
   Timer? _weakWifiBufferTimer;
-  /// Soft recover: keep playing demuxer cache, reconnect before it runs dry.
+  /// Background stream health watch: reconnect BEFORE buffering UI appears.
   Timer? _softRecoverTimer;
+  Timer? _freezeWatchTimer;
   bool _pendingSoftRecover = false;
-  static const int _softRecoverRemainSec = 12;
+  int _watchLastPos = -1;
+  int _watchLastBuf = -1;
+  int _watchBufStallTicks = 0;
+  int _watchFrozenTicks = 0;
+  static const int _softRecoverRemainSec = 18;
+  /// Buffer not growing for this many 2s samples while playing → download likely dead.
+  static const int _bufStallSamples = 3; // ~6s
+  /// Hard freeze fallback (pos+buf both stuck), should be rare if proactive path works.
+  static const int _freezeStuckSamples = 4; // ~8s
   StreamSubscription? _subForSeek;
   StreamSubscription<NetworkPolicyChange>? _networkPolicySubscription;
   Future<void> Function(NetworkPolicyChange change)? onNetworkPolicyChanged;
@@ -1718,9 +1727,11 @@ class PlPlayerController
   ) async {
     _weakWifiBufferTimer?.cancel();
     _weakWifiBufferTimer = null;
-    _softRecoverTimer?.cancel();
-    _softRecoverTimer = null;
-    _pendingSoftRecover = false;
+    _clearSoftRecover();
+    _watchLastPos = -1;
+    _watchLastBuf = -1;
+    _watchBufStallTicks = 0;
+    _watchFrozenTicks = 0;
     isBuffering.value = false;
     _heartDuration = 0;
     danmakuController?.clear();
@@ -1807,13 +1818,135 @@ class PlPlayerController
     _lastHwdecWatched = null;
   }
 
+  void _clearSoftRecover() {
+    _softRecoverTimer?.cancel();
+    _softRecoverTimer = null;
+    _pendingSoftRecover = false;
+  }
+
+  void _stopFreezeWatch() {
+    _freezeWatchTimer?.cancel();
+    _freezeWatchTimer = null;
+    _watchLastPos = -1;
+    _watchLastBuf = -1;
+    _watchBufStallTicks = 0;
+    _watchFrozenTicks = 0;
+  }
+
+  /// Silent reopen at current position. No toast.
+  void _softRefreshPlayer() {
+    if (dataSource is FileSource || isLive) return;
+    EasyThrottle.throttle(
+      'streamSoftRecover',
+      const Duration(seconds: 15),
+      () {
+        if (kDebugMode) {
+          debugPrint(
+            'streamWatch: silent refresh pos=${position.value}s buf=${buffered.value}s',
+          );
+        }
+        refreshPlayer();
+      },
+    );
+  }
+
+  void _armSoftRecover({required bool forceSoon}) {
+    if (isLive || dataSource is FileSource) return;
+    _pendingSoftRecover = true;
+    _softRecoverTimer?.cancel();
+    final delay =
+        forceSoon ? const Duration(seconds: 1) : const Duration(seconds: 3);
+    _softRecoverTimer = Timer(delay, () {
+      _softRecoverTimer = null;
+      if (!_pendingSoftRecover) return;
+      _softRefreshPlayer();
+    });
+  }
+
+  /// Background watch while content is still playing from cache.
+  /// Goal: reconnect before the buffering spinner is shown.
+  void _ensureFreezeWatch() {
+    if (isLive || dataSource is FileSource) return;
+    if (_freezeWatchTimer != null) return;
+    _watchLastPos = position.value;
+    _watchLastBuf = buffered.value;
+    _watchBufStallTicks = 0;
+    _watchFrozenTicks = 0;
+    _freezeWatchTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (isLive || dataSource is FileSource) {
+        _stopFreezeWatch();
+        return;
+      }
+      if (isSeeking.value || playerStatus.isCompleted) {
+        _watchBufStallTicks = 0;
+        _watchFrozenTicks = 0;
+        _watchLastPos = position.value;
+        _watchLastBuf = buffered.value;
+        return;
+      }
+      // Run during normal play too — not only when already buffering.
+      if (!playerStatus.isPlaying && !isBuffering.value) {
+        _watchBufStallTicks = 0;
+        _watchFrozenTicks = 0;
+        _watchLastPos = position.value;
+        _watchLastBuf = buffered.value;
+        return;
+      }
+
+      final pos = position.value;
+      final buf = buffered.value;
+      final remain = buf - pos;
+      final posMoved = pos > _watchLastPos;
+      final bufMoved = buf > _watchLastBuf;
+
+      // --- Proactive path: still playing from cache, download already dead ---
+      // Buffer stopped growing while playback continues → CDN/stream likely dropped.
+      if (playerStatus.isPlaying && !isBuffering.value) {
+        if (bufMoved) {
+          _watchBufStallTicks = 0;
+        } else if (posMoved) {
+          _watchBufStallTicks++;
+        }
+        // Reconnect early while user still watches remaining cache (no spinner yet).
+        final downloadLikelyDead = _watchBufStallTicks >= _bufStallSamples;
+        final cacheRunningLow =
+            remain >= 0 && remain <= _softRecoverRemainSec && posMoved;
+        if (downloadLikelyDead && (cacheRunningLow || remain <= 30)) {
+          if (kDebugMode) {
+            debugPrint(
+              'streamWatch: proactive reconnect remain=${remain}s bufStall=$_watchBufStallTicks',
+            );
+          }
+          _watchBufStallTicks = 0;
+          _softRefreshPlayer();
+        }
+      }
+
+      // --- Fallback: already frozen (spinner may show) ---
+      if (!posMoved && !bufMoved) {
+        _watchFrozenTicks++;
+        if (_watchFrozenTicks >= _freezeStuckSamples) {
+          _watchFrozenTicks = 0;
+          _softRefreshPlayer();
+        }
+      } else {
+        _watchFrozenTicks = 0;
+      }
+
+      if (posMoved) _watchLastPos = pos;
+      if (bufMoved) _watchLastBuf = buf;
+    });
+  }
+
   Future<void>? refreshPlayer() {
     if (dataSource is FileSource) {
       return null;
     }
-    _softRecoverTimer?.cancel();
-    _softRecoverTimer = null;
-    _pendingSoftRecover = false;
+    _clearSoftRecover();
+    _watchLastPos = position.value;
+    _watchLastBuf = buffered.value;
+    _watchBufStallTicks = 0;
+    _watchFrozenTicks = 0;
     if (_videoPlayerController case final ctr? when (ctr.current.isNotEmpty)) {
       PlaybackStatsService.rebase(ctr.state.position);
       var media = ctr.current.last;
@@ -1905,6 +2038,7 @@ class PlPlayerController
           _stopWakeLockTimer();
           _updatePlaybackState();
           WakelockPlus.enable();
+          if (!isLive) _ensureFreezeWatch();
 
           if (_isAutoEnterPip) {
             if (_isCurrVideoPage) {
@@ -2003,22 +2137,6 @@ class PlPlayerController
       }),
       stream.buffer.listen((Duration buffer) {
         buffered.value = buffer.inSeconds;
-        // While still playing cached packets, silently reopen before cache runs dry.
-        if (_pendingSoftRecover && !isLive) {
-          final remain = buffer.inSeconds - position.value;
-          if (remain >= 0 && remain <= _softRecoverRemainSec) {
-            _pendingSoftRecover = false;
-            _softRecoverTimer?.cancel();
-            _softRecoverTimer = null;
-            EasyThrottle.throttle(
-              'streamSoftRecover',
-              const Duration(seconds: 8),
-              () {
-                refreshPlayer();
-              },
-            );
-          }
-        }
       }),
       stream.buffering.listen((bool buffering) {
         PlaybackStatsService.updateBuffering(
@@ -2033,6 +2151,7 @@ class PlPlayerController
               ConnectivityUtils.markCurrentWifiWeak();
             }
           });
+          _ensureFreezeWatch();
         } else {
           _weakWifiBufferTimer?.cancel();
           _weakWifiBufferTimer = null;
@@ -2042,17 +2161,27 @@ class PlPlayerController
           _updatePlaybackState();
         }
       }),
-      if (kDebugMode)
-        stream.log.listen(((PlayerLog log) {
-          if (log.level == 'error' || log.level == 'fatal') {
+      stream.log.listen(((PlayerLog log) {
+        final text = log.text;
+        final isErr = log.level == 'error' || log.level == 'fatal';
+        if (isErr) {
+          if (kDebugMode) {
             Utils.reportError(
-              '${log.level}: ${log.prefix}: ${log.text}\n${player.state.playlist}',
+              '${log.level}: ${log.prefix}: $text\n${player.state.playlist}',
               null,
             );
-          } else {
-            debugPrint(log.toString());
           }
-        })),
+          // Some demuxer/network failures only surface on the log stream.
+          if (!isLive &&
+              (text.contains('Stream ends prematurely') ||
+                  text.contains('Invalid NAL unit size') ||
+                  (text.contains('tls') && text.contains('End of file')))) {
+            _armSoftRecover(forceSoon: false);
+          }
+        } else if (kDebugMode) {
+          debugPrint(log.toString());
+        }
+      })),
       stream.error.listen((String event) {
         if (dataSource is FileSource &&
             (event.startsWith('Failed to open file') ||
@@ -2088,18 +2217,8 @@ class PlPlayerController
             (event.contains('tls:') &&
                 (event.contains('End of file') ||
                     event.contains('Failed to send close message')))) {
-          _pendingSoftRecover = true;
-          _softRecoverTimer?.cancel();
-          // Fallback: if already stalled (almost no remaining cache), hard recover.
-          _softRecoverTimer = Timer(const Duration(seconds: 6), () {
-            _softRecoverTimer = null;
-            if (!_pendingSoftRecover) return;
-            if (isBuffering.value &&
-                buffered.value <= position.value + 2) {
-              _pendingSoftRecover = false;
-              refreshPlayer();
-            }
-          });
+          _armSoftRecover(forceSoon: isBuffering.value &&
+              buffered.value <= position.value + 2);
           return;
         }
         if (event.startsWith("Failed to open https://") ||
@@ -2164,9 +2283,8 @@ class PlPlayerController
     _subscriptions?.forEach((e) => e.cancel());
     _subscriptions?.clear();
     _subscriptions = null;
-    _softRecoverTimer?.cancel();
-    _softRecoverTimer = null;
-    _pendingSoftRecover = false;
+    _clearSoftRecover();
+    _stopFreezeWatch();
   }
 
   void _cancelSubForSeek() {
@@ -3224,9 +3342,8 @@ class PlPlayerController
     _timer?.cancel();
     _weakWifiBufferTimer?.cancel();
     _weakWifiBufferTimer = null;
-    _softRecoverTimer?.cancel();
-    _softRecoverTimer = null;
-    _pendingSoftRecover = false;
+    _clearSoftRecover();
+    _stopFreezeWatch();
     _networkPolicySubscription?.cancel();
     _networkPolicySubscription = null;
     onNetworkPolicyChanged = null;

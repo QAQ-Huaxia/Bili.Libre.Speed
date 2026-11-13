@@ -1661,9 +1661,9 @@ class PlPlayerController
     assert(_videoPlayerController == null);
     final opt = {
       'video-sync': Pref.videoSync,
+      // Avoid reconnect_streamed: Bilibili premature EOF can leave demuxer
+      // buffering forever with no traffic. Match PiliPlus; recover via full open.
       'network-timeout': '15',
-      'stream-lavf-o':
-          'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=30',      
       if (Platform.isAndroid) 'ao': Pref.audioOutput,
       'volume':
           (PlatformUtils.isMobile ? Pref.playerVolume : volume.value * 100)
@@ -1834,65 +1834,22 @@ class PlPlayerController
     _watchFrozenTicks = 0;
   }
 
-  /// Light recovery first (seek), escalate to full open if still stuck.
-  /// No toast. Independent of error logs.
-  void _softRefreshPlayer({bool forceFull = false}) {
+  /// Full reopen at current position only. Seek cannot revive Bilibili premature EOF.
+  /// No toast. May briefly black-screen; better than stuck buffering with no traffic.
+  void _softRefreshPlayer({bool forceFull = true}) {
     if (dataSource is FileSource || isLive) return;
     EasyThrottle.throttle(
       'streamSoftRecover',
       const Duration(seconds: 12),
-      () async {
-        final pos = position.value;
-        final buf = buffered.value;
+      () {
         if (kDebugMode) {
           debugPrint(
-            'streamWatch: recover forceFull=$forceFull pos=${pos}s buf=${buf}s',
+            'streamWatch: full open pos=${position.value}s buf=${buffered.value}s',
           );
         }
-        if (!forceFull) {
-          // Light path: seek to current position to kick demuxer/HTTP without full reopen.
-          final ok = await _lightRecoverSeek();
-          if (ok) {
-            // Give the light path a moment; freeze watch will escalate if still stuck.
-            _watchBufStallTicks = 0;
-            _watchFrozenTicks = 0;
-            _watchLastPos = position.value;
-            _watchLastBuf = buffered.value;
-            return;
-          }
-        }
-        // Heavy path: full open at current position (may briefly black-screen).
         refreshPlayer();
       },
     );
-  }
-
-  /// Try to resume network read without tearing down VO/decoder.
-  /// Returns true if a seek was issued.
-  Future<bool> _lightRecoverSeek() async {
-    final player = _videoPlayerController;
-    if (player == null) return false;
-    try {
-      final current = player.state.position;
-      // Tiny forward nudge helps some demuxers re-issue range requests.
-      var target = current;
-      final dur = player.state.duration;
-      if (dur > Duration.zero) {
-        final nudged = current + const Duration(milliseconds: 50);
-        target = nudged < dur ? nudged : current;
-      }
-      if (kDebugMode) {
-        debugPrint('streamWatch: light seek -> ${target.inMilliseconds}ms');
-      }
-      await player.seek(target);
-      if (!player.state.playing && playerStatus.isPlaying) {
-        await player.play();
-      }
-      return true;
-    } catch (e) {
-      if (kDebugMode) debugPrint('streamWatch: light seek failed: $e');
-      return false;
-    }
   }
 
   void _armSoftRecover({required bool forceSoon}) {
@@ -2005,6 +1962,17 @@ class PlPlayerController
     _watchFrozenTicks = 0;
     if (_videoPlayerController case final ctr? when (ctr.current.isNotEmpty)) {
       PlaybackStatsService.rebase(ctr.state.position);
+      final fallback = onCdnFallback;
+      if (fallback != null) {
+        return () async {
+          try {
+            if (await fallback() == true) return;
+          } catch (_) {}
+          var media = ctr.current.last;
+          if (!isLive) media = media.copyWith(start: ctr.state.position);
+          await ctr.open(media, play: true);
+        }();
+      }
       var media = ctr.current.last;
       if (!isLive) media = media.copyWith(start: ctr.state.position);
       return ctr.open(media, play: true);

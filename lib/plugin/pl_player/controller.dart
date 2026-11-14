@@ -1,4 +1,4 @@
-[cite: 1]import 'dart:async' show StreamSubscription, Timer, unawaited;
+import 'dart:async' show StreamSubscription, Timer, unawaited;
 import 'dart:convert' show ascii, utf8;
 import 'dart:io' show Platform;
 import 'dart:math' show max, min;
@@ -38,7 +38,6 @@ import 'package:PiliBro/services/pip_overlay_service.dart';
 import 'package:PiliBro/services/playback_focus.dart';
 import 'package:PiliBro/services/service_locator.dart';
 import 'package:PiliBro/services/playback_stats_service.dart';
-import 'package:PiliBro/services/service_locator.dart';
 import 'package:PiliBro/utils/accounts.dart';
 import 'package:PiliBro/utils/android/android_helper.dart';
 import 'package:PiliBro/utils/android/bindings.g.dart';
@@ -92,9 +91,9 @@ class PlPlayerController
 
   static PlPlayerController? _instance;
 
-  PlayerStatus playerStatus = .paused;
+  PlayerStatus playerStatus = PlayerStatus.paused;
 
-  final Rx<DataStatus> dataStatus = Rx(.none);
+  final Rx<DataStatus> dataStatus = Rx(DataStatus.none);
 
   Duration? seekToPos;
   bool hasToasted = false;
@@ -145,7 +144,7 @@ class PlPlayerController
 
   bool _isVertical = false;
 
-  final Rx<VideoFitType> videoFit = Rx(.contain);
+  final Rx<VideoFitType> videoFit = Rx(VideoFitType.contain);
 
   late final RxBool continuePlayInBackground =
       Pref.continuePlayInBackground.obs;
@@ -174,7 +173,7 @@ class PlPlayerController
 
   Timer? _timer;
   Timer? _weakWifiBufferTimer;
-  Timer? _stuckWatchdogTimer; // 后台静默重试看门狗
+  Timer? _stuckWatchdogTimer;
   Duration? _lastStuckPosition;
   int _stuckTicks = 0;
   bool _isSilentRecovering = false;
@@ -248,7 +247,7 @@ class PlPlayerController
     if (lastOrientation != orientation) {
       final double width, height;
       switch (orientation) {
-        case .portrait:
+        case nativeapi.Orientation.portrait:
           if (lastSize.width > size.height) {
             height = min(lastSize.width, _lastWindowBounds.size.height);
             width = height * aspectRatio;
@@ -256,7 +255,7 @@ class PlPlayerController
             height = size.height;
             width = size.width;
           }
-        case .landscape:
+        case nativeapi.Orientation.landscape:
           if (lastSize.height > size.width) {
             width = lastSize.height;
             height = width / aspectRatio;
@@ -308,7 +307,7 @@ class PlPlayerController
       'window',
       videoPlayerController?.state.position ?? Duration.zero,
     );
-    if (showWindowTitleBar) window.titleBarStyle = .normal;
+    if (showWindowTitleBar) window.titleBarStyle = TitleBarStyle.normal;
     window
       ..minimumSize = DeviceUtils.desktopMinSize
       ..bounds = _lastWindowBounds
@@ -330,7 +329,7 @@ class PlPlayerController
 
     _lastWindowBounds = window.bounds;
 
-    if (showWindowTitleBar) window.titleBarStyle = .hidden;
+    if (showWindowTitleBar) window.titleBarStyle = TitleBarStyle.hidden;
 
     const shortSide = 280.0;
     const minShortSide = 160.0;
@@ -1574,7 +1573,7 @@ class PlPlayerController
       updateDuration(duration ?? _videoPlayerController!.state.duration);
       position.value = buffered.value = seekTo?.inSeconds ?? 0;
 
-      dataStatus.value = .loaded;
+      dataStatus.value = DataStatus.loaded;
 
       if (allowsAutoFullScreen(autoFullScreen)) {
         triggerFullScreen(
@@ -1671,7 +1670,7 @@ class PlPlayerController
 
     final player = await Player.create(
       configuration: PlayerConfiguration(
-        logLevel: kDebugMode ? .warn : .error,
+        logLevel: kDebugMode ? LogLevel.warn : LogLevel.error,
         options: opt,
       ),
     );
@@ -1735,7 +1734,7 @@ class PlPlayerController
         return;
       }
       _videoPlayerController = player;
-      if (isAnim && superResolutionType.value != .disable) {
+      if (isAnim && superResolutionType.value != SuperResolutionType.disable) {
         await setShader();
       }
     }
@@ -1804,7 +1803,7 @@ class PlPlayerController
     _nextHwdecWatchTick = _positionClock.elapsedTicks + _hwdecWatchTicks;
     _lastHwdecWatched = null;
 
-    // 启动精准防卡死监控：缓冲中且进度/缓存静默 15 秒不动时，后台静默重试刷新
+    // 启动长视频卡死看门狗：监控 buffering 状态、播放进度是否卡死
     _initStuckWatchdog();
   }
 
@@ -1943,7 +1942,7 @@ class PlPlayerController
         PlaybackStatsService.updatePlaying(playing, player.state.position);
         if (playing) {
           PlaybackFocus.onStart();
-          playerStatus = .playing;
+          playerStatus = PlayerStatus.playing;
           _stopWakeLockTimer();
           _updatePlaybackState();
           WakelockPlus.enable();
@@ -1956,19 +1955,19 @@ class PlPlayerController
             }
           }
         } else {
-          playerStatus = .paused;
+          playerStatus = PlayerStatus.paused;
           _startWakeLockTimer();
           _disableAutoEnterPip();
           _updateIOSPip();
         }
 
         for (final element in _statusListeners) {
-          element(playing ? .playing : .paused);
+          element(playing ? PlayerStatus.playing : PlayerStatus.paused);
         }
 
         final seconds = videoPlayerController!.state.position.inSeconds;
         if (seconds != 0) {
-          makeHeartBeat(seconds, type: .status);
+          makeHeartBeat(seconds, type: HeartBeatType.status);
         }
       }),
 
@@ -1976,14 +1975,14 @@ class PlPlayerController
       stream.completed.listen((bool completed) {
         if (completed) {
           PlaybackStatsService.markCompleted(player.state.position);
-          playerStatus = .completed;
+          playerStatus = PlayerStatus.completed;
           _startWakeLockTimer();
 
           for (final element in _statusListeners) {
-            element(.completed);
+            element(PlayerStatus.completed);
           }
 
-          makeHeartBeat(-1, type: .completed);
+          makeHeartBeat(-1, type: HeartBeatType.completed);
         }
       }),
 
@@ -2290,13 +2289,13 @@ class PlPlayerController
 
     await _videoPlayerController?.play();
 
-    playerStatus = .playing;
+    playerStatus = PlayerStatus.playing;
   }
 
   /// 暂停播放
   Future<void> pause({bool notify = true, bool isInterrupt = false}) async {
     await _videoPlayerController?.pause();
-    playerStatus = .paused;
+    playerStatus = PlayerStatus.paused;
 
     // 主动暂停时让出音频焦点
     if (!isInterrupt) PlaybackFocus.onStop();
@@ -2371,8 +2370,8 @@ class PlPlayerController
   /// 读取fit
   var _prefFit = VideoFitType.values[Pref.cacheVideoFit];
   void _initVideoFit() {
-    if (_prefFit == .fill && _isVertical) {
-      videoFit.value = .contain;
+    if (_prefFit == VideoFitType.fill && _isVertical) {
+      videoFit.value = VideoFitType.contain;
     } else {
       videoFit.value = _prefFit;
     }
@@ -3085,7 +3084,7 @@ class PlPlayerController
   // 记录播放记录
   Future<void>? makeHeartBeat(
     int progress, {
-    HeartBeatType type = .playing,
+    HeartBeatType type = HeartBeatType.playing,
     bool isManual = false,
     dynamic aid,
     dynamic bvid,
@@ -3116,18 +3115,18 @@ class PlPlayerController
     }
 
     switch (type) {
-      case .playing:
+      case HeartBeatType.playing:
         if (progress > _heartDuration &&
             (progress & ~7) != (_heartDuration & ~7)) {
           _heartDuration = progress;
           return send();
         }
-      case .status:
+      case HeartBeatType.status:
         if (progress - _heartDuration > 1) {
           _heartDuration = progress;
           return send();
         }
-      case .completed:
+      case HeartBeatType.completed:
         if (playerStatus.isCompleted &&
             (durationInMilliseconds - positionInMilliseconds) < 1000) {
           progress = -1;
@@ -3350,7 +3349,7 @@ class PlPlayerController
           Future<void> save() async {
             if (_screenshotState > 1) return;
             _screenshotState = 2;
-            final bytes = await image.toByteData(format: .png);
+            final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
             if (bytes != null) {
               final time = DurationUtils.formatDuration(
                 positionInMilliseconds / 1000,
@@ -3370,12 +3369,12 @@ class PlPlayerController
             onKeyEvent: (node, event) {
               if (event is KeyDownEvent) {
                 final key = event.logicalKey;
-                if (key == .keyS || key == .enter || key == .numpadEnter) {
+                if (key == LogicalKeyboardKey.keyS || key == LogicalKeyboardKey.enter || key == LogicalKeyboardKey.numpadEnter) {
                   save();
-                  return .handled;
+                  return KeyEventResult.handled;
                 }
               }
-              return .ignored;
+              return KeyEventResult.ignored;
             },
             child: GestureDetector(
               onTap: save,

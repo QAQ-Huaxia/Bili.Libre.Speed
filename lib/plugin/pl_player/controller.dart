@@ -1,4 +1,4 @@
-import 'dart:async' show StreamSubscription, Timer, unawaited;
+[cite: 1]import 'dart:async' show StreamSubscription, Timer, unawaited;
 import 'dart:convert' show ascii, utf8;
 import 'dart:io' show Platform;
 import 'dart:math' show max, min;
@@ -174,20 +174,11 @@ class PlPlayerController
 
   Timer? _timer;
   Timer? _weakWifiBufferTimer;
-  /// Background stream health watch: reconnect BEFORE buffering UI appears.
-  Timer? _softRecoverTimer;
-  Timer? _freezeWatchTimer;
-  bool _pendingSoftRecover = false;
-  int _watchLastPos = -1;
-  int _watchLastBuf = -1;
-  int _watchBufStallTicks = 0;
-  int _watchFrozenTicks = 0;
-  /// Reconnect while this much cache still remains (seconds).
-  static const int _proactiveRemainSec = 45;
-  /// Buffer not growing for this many 2s samples → download likely idle/dead.
-  static const int _bufStallSamples = 2; // ~4s
-  /// Hard freeze fallback if proactive path missed.
-  static const int _freezeStuckSamples = 4; // ~8s
+  Timer? _stuckWatchdogTimer; // 后台静默重试看门狗
+  Duration? _lastStuckPosition;
+  int _stuckTicks = 0;
+  bool _isSilentRecovering = false;
+
   StreamSubscription? _subForSeek;
   StreamSubscription<NetworkPolicyChange>? _networkPolicySubscription;
   Future<void> Function(NetworkPolicyChange change)? onNetworkPolicyChanged;
@@ -1661,9 +1652,9 @@ class PlPlayerController
     assert(_videoPlayerController == null);
     final opt = {
       'video-sync': Pref.videoSync,
-      // Avoid reconnect_streamed: Bilibili premature EOF can leave demuxer
-      // buffering forever with no traffic. Match PiliPlus; recover via full open.
       'network-timeout': '15',
+      'stream-lavf-o':
+          'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=30',      
       if (Platform.isAndroid) 'ao': Pref.audioOutput,
       'volume':
           (PlatformUtils.isMobile ? Pref.playerVolume : volume.value * 100)
@@ -1728,11 +1719,6 @@ class PlPlayerController
   ) async {
     _weakWifiBufferTimer?.cancel();
     _weakWifiBufferTimer = null;
-    _clearSoftRecover();
-    _watchLastPos = -1;
-    _watchLastBuf = -1;
-    _watchBufStallTicks = 0;
-    _watchFrozenTicks = 0;
     isBuffering.value = false;
     _heartDuration = 0;
     danmakuController?.clear();
@@ -1817,137 +1803,52 @@ class PlPlayerController
     _hwdecWatchTicks = Pref.hwdecWatchSeconds * _positionClock.frequency;
     _nextHwdecWatchTick = _positionClock.elapsedTicks + _hwdecWatchTicks;
     _lastHwdecWatched = null;
+
+    // 启动精准防卡死监控：缓冲中且进度/缓存静默 15 秒不动时，后台静默重试刷新
+    _initStuckWatchdog();
   }
 
-  void _clearSoftRecover() {
-    _softRecoverTimer?.cancel();
-    _softRecoverTimer = null;
-    _pendingSoftRecover = false;
-  }
+  /// 启动长视频卡死看门狗：监控 buffering 状态、播放进度是否卡死、缓存余量
+  void _initStuckWatchdog() {
+    _stuckWatchdogTimer?.cancel();
+    _stuckTicks = 0;
+    _lastStuckPosition = null;
 
-  void _stopFreezeWatch() {
-    _freezeWatchTimer?.cancel();
-    _freezeWatchTimer = null;
-    _watchLastPos = -1;
-    _watchLastBuf = -1;
-    _watchBufStallTicks = 0;
-    _watchFrozenTicks = 0;
-  }
+    _stuckWatchdogTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
+      if (_isSilentRecovering || _videoPlayerController == null || isLive) return;
 
-  /// Full reopen at current position only. Seek cannot revive Bilibili premature EOF.
-  /// No toast. May briefly black-screen; better than stuck buffering with no traffic.
-  void _softRefreshPlayer({bool forceFull = true}) {
-    if (dataSource is FileSource || isLive) return;
-    EasyThrottle.throttle(
-      'streamSoftRecover',
-      const Duration(seconds: 12),
-      () {
-        if (kDebugMode) {
-          debugPrint(
-            'streamWatch: full open pos=${position.value}s buf=${buffered.value}s',
-          );
-        }
-        refreshPlayer();
-      },
-    );
-  }
-
-  void _armSoftRecover({required bool forceSoon}) {
-    if (isLive || dataSource is FileSource) return;
-    _pendingSoftRecover = true;
-    _softRecoverTimer?.cancel();
-    final delay =
-        forceSoon ? const Duration(seconds: 1) : const Duration(seconds: 3);
-    _softRecoverTimer = Timer(delay, () {
-      _softRecoverTimer = null;
-      if (!_pendingSoftRecover) return;
-      _softRefreshPlayer();
-    });
-  }
-
-  /// Background watch while content is still playing from cache.
-  /// Must fire BEFORE isBuffering latches, otherwise only the black-screen fallback runs.
-  void _ensureFreezeWatch() {
-    if (isLive || dataSource is FileSource) return;
-    if (_freezeWatchTimer != null) return;
-    _watchLastPos = position.value;
-    _watchLastBuf = buffered.value;
-    _watchBufStallTicks = 0;
-    _watchFrozenTicks = 0;
-    _freezeWatchTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-      if (isLive || dataSource is FileSource) {
-        _stopFreezeWatch();
-        return;
-      }
-      if (isSeeking.value || playerStatus.isCompleted) {
-        _watchBufStallTicks = 0;
-        _watchFrozenTicks = 0;
-        _watchLastPos = position.value;
-        _watchLastBuf = buffered.value;
-        return;
-      }
-      if (!playerStatus.isPlaying && !isBuffering.value) {
-        _watchBufStallTicks = 0;
-        _watchFrozenTicks = 0;
-        _watchLastPos = position.value;
-        _watchLastBuf = buffered.value;
+      final state = _videoPlayerController!.state;
+      if (!state.playing) {
+        _stuckTicks = 0;
+        _lastStuckPosition = null;
         return;
       }
 
-      final pos = position.value;
-      final buf = buffered.value;
-      final remain = buf - pos;
-      final posMoved = pos > _watchLastPos;
-      final bufMoved = buf > _watchLastBuf;
+      final currentPos = state.position;
+      final isBufferingStuck = state.buffering && (currentPos == _lastStuckPosition);
 
-      // Track download health even after buffering flag flips true.
-      if (bufMoved) {
-        _watchBufStallTicks = 0;
-      } else if (posMoved || isBuffering.value) {
-        // pos advancing with flat buffer, or already buffering with flat buffer.
-        _watchBufStallTicks++;
-      }
-
-      // --- Proactive: still have cache headroom, download not advancing ---
-      // Do NOT require !isBuffering — the flag often flips true only when remain is tiny.
-      final downloadStalled = _watchBufStallTicks >= _bufStallSamples;
-      final hasCacheHeadroom = remain > 2;
-      final shouldProactive = downloadStalled &&
-          hasCacheHeadroom &&
-          remain <= _proactiveRemainSec;
-      if (shouldProactive) {
-        if (kDebugMode) {
-          debugPrint(
-            'streamWatch: proactive reconnect remain=${remain}s '
-            'bufStall=$_watchBufStallTicks buffering=${isBuffering.value}',
-          );
-        }
-        _watchBufStallTicks = 0;
-        _watchFrozenTicks = 0;
-        _softRefreshPlayer();
-      } else if (downloadStalled && isBuffering.value && remain <= 5) {
-        // Spinner + almost no cache: light seek rarely helps, go full open.
-        if (kDebugMode) {
-          debugPrint('streamWatch: early full open at spinner remain=$remain');
-        }
-        _watchBufStallTicks = 0;
-        _watchFrozenTicks = 0;
-        _softRefreshPlayer(forceFull: true);
-      }
-
-      // --- Hard fallback: fully frozen → full open (light seek already failed or too late)
-      if (!posMoved && !bufMoved) {
-        _watchFrozenTicks++;
-        if (_watchFrozenTicks >= _freezeStuckSamples) {
-          _watchFrozenTicks = 0;
-          _softRefreshPlayer(forceFull: true);
+      if (isBufferingStuck) {
+        _stuckTicks++;
+        // 每次 3 秒，累积 5 次即达到 15 秒
+        if (_stuckTicks >= 5) {
+          _isSilentRecovering = true;
+          _stuckTicks = 0;
+          try {
+            PlaybackStatsService.rebase(currentPos);
+            var media = _videoPlayerController!.current.last;
+            media = media.copyWith(start: currentPos);
+            await _videoPlayerController!.open(media, play: true);
+          } catch (_) {
+            // 个人项目不写冗余的兜底
+          } finally {
+            _isSilentRecovering = false;
+            _lastStuckPosition = _videoPlayerController?.state.position;
+          }
         }
       } else {
-        _watchFrozenTicks = 0;
+        _stuckTicks = 0;
+        _lastStuckPosition = currentPos;
       }
-
-      if (posMoved) _watchLastPos = pos;
-      if (bufMoved) _watchLastBuf = buf;
     });
   }
 
@@ -1955,24 +1856,8 @@ class PlPlayerController
     if (dataSource is FileSource) {
       return null;
     }
-    _clearSoftRecover();
-    _watchLastPos = position.value;
-    _watchLastBuf = buffered.value;
-    _watchBufStallTicks = 0;
-    _watchFrozenTicks = 0;
     if (_videoPlayerController case final ctr? when (ctr.current.isNotEmpty)) {
       PlaybackStatsService.rebase(ctr.state.position);
-      final fallback = onCdnFallback;
-      if (fallback != null) {
-        return () async {
-          try {
-            if (await fallback() == true) return;
-          } catch (_) {}
-          var media = ctr.current.last;
-          if (!isLive) media = media.copyWith(start: ctr.state.position);
-          await ctr.open(media, play: true);
-        }();
-      }
       var media = ctr.current.last;
       if (!isLive) media = media.copyWith(start: ctr.state.position);
       return ctr.open(media, play: true);
@@ -2062,7 +1947,6 @@ class PlPlayerController
           _stopWakeLockTimer();
           _updatePlaybackState();
           WakelockPlus.enable();
-          if (!isLive) _ensureFreezeWatch();
 
           if (_isAutoEnterPip) {
             if (_isCurrVideoPage) {
@@ -2167,7 +2051,6 @@ class PlPlayerController
           buffering,
           player.state.position,
         );
-        final wasBuffering = isBuffering.value;
         isBuffering.value = buffering;
         if (buffering && !isLive) {
           _weakWifiBufferTimer ??= Timer(const Duration(seconds: 5), () {
@@ -2176,19 +2059,6 @@ class PlPlayerController
               ConnectivityUtils.markCurrentWifiWeak();
             }
           });
-          _ensureFreezeWatch();
-          // Rising edge of buffering: if cache already thin or download was stalling, reconnect now.
-          if (!wasBuffering) {
-            final remain = buffered.value - position.value;
-            if (remain <= _proactiveRemainSec || _watchBufStallTicks >= _bufStallSamples) {
-              if (kDebugMode) {
-                debugPrint(
-                  'streamWatch: buffering edge reconnect remain=$remain stall=$_watchBufStallTicks',
-                );
-              }
-              _softRefreshPlayer();
-            }
-          }
         } else {
           _weakWifiBufferTimer?.cancel();
           _weakWifiBufferTimer = null;
@@ -2198,27 +2068,17 @@ class PlPlayerController
           _updatePlaybackState();
         }
       }),
-      stream.log.listen(((PlayerLog log) {
-        final text = log.text;
-        final isErr = log.level == 'error' || log.level == 'fatal';
-        if (isErr) {
-          if (kDebugMode) {
+      if (kDebugMode)
+        stream.log.listen(((PlayerLog log) {
+          if (log.level == 'error' || log.level == 'fatal') {
             Utils.reportError(
-              '${log.level}: ${log.prefix}: $text\n${player.state.playlist}',
+              '${log.level}: ${log.prefix}: ${log.text}\n${player.state.playlist}',
               null,
             );
+          } else {
+            debugPrint(log.toString());
           }
-          // Some demuxer/network failures only surface on the log stream.
-          if (!isLive &&
-              (text.contains('Stream ends prematurely') ||
-                  text.contains('Invalid NAL unit size') ||
-                  (text.contains('tls') && text.contains('End of file')))) {
-            _armSoftRecover(forceSoon: false);
-          }
-        } else if (kDebugMode) {
-          debugPrint(log.toString());
-        }
-      })),
+        })),
       stream.error.listen((String event) {
         if (dataSource is FileSource &&
             (event.startsWith('Failed to open file') ||
@@ -2245,17 +2105,6 @@ class PlPlayerController
               event.startsWith("Can not open external file https://")) {
             Timer(const Duration(milliseconds: 3000), refreshPlayer);
           }
-          return;
-        }
-        // Stream corruption / CDN premature close: keep playing demuxer cache,
-        // mark soft recover and reopen silently before buffer is exhausted.
-        if (event.contains('Stream ends prematurely') ||
-            event.contains('Invalid NAL unit size') ||
-            (event.contains('tls:') &&
-                (event.contains('End of file') ||
-                    event.contains('Failed to send close message')))) {
-          _armSoftRecover(forceSoon: isBuffering.value &&
-              buffered.value <= position.value + 2);
           return;
         }
         if (event.startsWith("Failed to open https://") ||
@@ -2320,8 +2169,6 @@ class PlPlayerController
     _subscriptions?.forEach((e) => e.cancel());
     _subscriptions?.clear();
     _subscriptions = null;
-    _clearSoftRecover();
-    _stopFreezeWatch();
   }
 
   void _cancelSubForSeek() {
@@ -3379,8 +3226,8 @@ class PlPlayerController
     _timer?.cancel();
     _weakWifiBufferTimer?.cancel();
     _weakWifiBufferTimer = null;
-    _clearSoftRecover();
-    _stopFreezeWatch();
+    _stuckWatchdogTimer?.cancel();
+    _stuckWatchdogTimer = null;
     _networkPolicySubscription?.cancel();
     _networkPolicySubscription = null;
     onNetworkPolicyChanged = null;
